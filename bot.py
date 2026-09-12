@@ -1,7 +1,5 @@
 import os
-import time
 import asyncio
-import uuid
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -10,111 +8,129 @@ from aiohttp import web
 
 import database as db
 
+# Render Environment Variables
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 PRIVATE_GROUP_ID = int(os.environ.get("PRIVATE_GROUP_ID"))
-UPI_GATEWAY_KEY = os.environ.get("UPI_GATEWAY_KEY", "YOUR_GATEWAY_KEY")
+ADMIN_ID = int(os.environ.get("ADMIN_ID"))
+UPI_ID = os.environ.get("UPI_ID", "your-upi@upi")  # Render me apni actual UPI ID daalein
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# 1. /start Command - Plans Show Karega
+# 1. /start command
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message):
     builder = InlineKeyboardBuilder()
-    builder.button(text="1 Month - ₹199", callback_data="plan_1_199")
-    builder.button(text="3 Months - ₹499", callback_data="plan_3_499")
+    builder.button(text="1 Month Plan - ₹199", callback_data="plan_1_199")
+    builder.button(text="3 Months Plan - ₹499", callback_data="plan_3_499")
     builder.adjust(1)
     
     await message.answer(
-        "👋 Welcome! Hamare Private Group ka premium access lene ke liye plan select karein:",
+        "👋 Welcome! Private Group access ke liye apna plan chunein:",
         reply_markup=builder.as_markup()
     )
 
-# 2. Automated Payment Link Generator
+# 2. Plan Selection
 @dp.callback_query(F.data.startswith("plan_"))
-async def create_payment_order(callback: types.CallbackQuery):
-    _, months_str, amount_str = callback.data.split("_")
-    months = int(months_str)
-    amount = float(amount_str)
-    user_id = callback.from_user.id
+async def select_plan(callback: types.CallbackQuery):
+    _, months, amount = callback.data.split("_")
     
-    order_id = f"SUB_{int(time.time())}_{uuid.uuid4().hex[:6]}"
-    await db.create_order(order_id, user_id, months)
-    
-    # Standard UPI Payment Gateway URL
-    payment_url = f"https://api.ekqr.in/api/create_order?key={UPI_GATEWAY_KEY}&client_txn_id={order_id}&amount={amount}&p_info=Subscription&customer_name={user_id}&customer_email=user@bot.com&customer_mobile=9999999999&redirect_url=https://t.me/"
-    
-    builder = InlineKeyboardBuilder()
-    builder.button(text=f"Pay ₹{amount} Now (UPI)", url=payment_url)
-    builder.button(text="Check Status", callback_data=f"check_{order_id}")
-    builder.adjust(1)
-
-    await callback.message.answer(
-        f"💳 **Order Created!**\n\n"
-        f"• Plan: **{months} Month(s)**\n"
-        f"• Amount: **₹{amount}**\n"
-        f"• Order ID: `{order_id}`\n\n"
-        "Neeche button par click karke GPay/PhonePe/Paytm se pay karein. Payment hone ke baad bot turant aapko join link bhej dega.",
-        reply_markup=builder.as_markup(),
-        parse_mode="Markdown"
+    text = (
+        f"✅ **Plan:** {months} Month(s)\n"
+        f"💵 **Amount:** ₹{amount}\n\n"
+        f"📌 **UPI ID:** `{UPI_ID}`\n\n"
+        "Kisi bhi UPI App (PhonePe / GooglePay / Paytm) se upar di gayi UPI ID par payment karein.\n\n"
+        "Payment ke baad **Transaction Screenshot** ya **12-digit UTR Number** yahan send karein."
     )
+    await callback.message.answer(text, parse_mode="Markdown")
     await callback.answer()
 
-# 3. Manual Status Check Button
-@dp.callback_query(F.data.startswith("check_"))
-async def check_status_btn(callback: types.CallbackQuery):
-    order_id = callback.data.split("_")[1]
-    order = await db.get_order(order_id)
-    if order and order[2] == "PAID":
-        await callback.answer("Payment already verified!", show_alert=True)
-    else:
-        await callback.answer("Payment verify nahi hua hai. Agar aap pay kar chuke hain toh 1 minute wait karein.", show_alert=True)
+# 3. Screenshot Proof Handler
+@dp.message(F.photo)
+async def handle_photo(message: types.Message):
+    user = message.from_user
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Approve 1 Month", callback_data=f"app_{user.id}_1")
+    builder.button(text="Approve 3 Months", callback_data=f"app_{user.id}_3")
+    builder.button(text="Reject", callback_data=f"rej_{user.id}")
+    builder.adjust(2)
+    
+    await bot.send_photo(
+        chat_id=ADMIN_ID,
+        photo=message.photo[-1].file_id,
+        caption=f"Payment Proof Aaya Hai!\nUser: @{user.username} (`{user.id}`)",
+        reply_markup=builder.as_markup()
+    )
+    await message.answer("Aapka screenshot mil gaya hai. Verify hote hi aapko invite link mil jayega.")
 
-# 4. Webhook Server: Payment Gateway Instant Callback
-async def handle_payment_webhook(request):
+# 4. Text / UTR Proof Handler
+@dp.message(F.text)
+async def handle_text(message: types.Message):
+    if message.text.startswith('/'):
+        return
+    user = message.from_user
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Approve 1 Month", callback_data=f"app_{user.id}_1")
+    builder.button(text="Approve 3 Months", callback_data=f"app_{user.id}_3")
+    builder.button(text="Reject", callback_data=f"rej_{user.id}")
+    builder.adjust(2)
+    
+    await bot.send_message(
+        chat_id=ADMIN_ID,
+        text=f"UTR / Payment Message:\n`{message.text}`\nUser: @{user.username} (`{user.id}`)",
+        reply_markup=builder.as_markup()
+    )
+    await message.answer("Details mil gayi hain. Verification ke baad automatic link activate ho jayegi.")
+
+# 5. Admin Approval & Auto Single-Use Invite Link
+@dp.callback_query(F.data.startswith("app_"))
+async def approve_user(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return await callback.answer("Sirf Admin approve kar sakta hai.", show_alert=True)
+    
+    _, user_id_str, months_str = callback.data.split("_")
+    user_id = int(user_id_str)
+    months = int(months_str)
+
+    expiry = await db.add_or_update_subscriber(user_id, months)
+
+    # 1-time usable private invite link
+    invite = await bot.create_chat_invite_link(
+        chat_id=PRIVATE_GROUP_ID,
+        member_limit=1
+    )
+
     try:
-        data = await request.post()
-        if not data:
-            data = await request.json()
-
-        # Gateway response verification
-        status = data.get("status")
-        order_id = data.get("client_txn_id")
-
-        if status == "success" and order_id:
-            order = await db.get_order(order_id)
-            if order and order[2] != "PAID":
-                user_id, months, _ = order
-                await db.mark_order_paid(order_id)
-                expiry = await db.add_or_update_subscriber(user_id, months)
-
-                # Generate 1-time single use invite link
-                invite_link = await bot.create_chat_invite_link(
-                    chat_id=PRIVATE_GROUP_ID,
-                    member_limit=1
-                )
-
-                # Send link to user
-                await bot.send_message(
-                    chat_id=user_id,
-                    text=(
-                        f"🎉 **Payment Successful!**\n\n"
-                        f"Aapka membership activate ho gaya hai.\n"
-                        f"📅 Expiry Date: **{expiry.strftime('%d-%m-%Y')}**\n\n"
-                        f"🔗 **Group Join Link:** {invite_link.invite_link}\n\n"
-                        "⚠️ *Yeh link sirf aapke liye hai aur ek baar join karne ke baad expire ho jayegi.*"
-                    ),
-                    parse_mode="Markdown"
-                )
-        return web.Response(text="OK")
+        await bot.send_message(
+            chat_id=user_id,
+            text=(
+                f"🎉 **Payment Verified Successfully!**\n\n"
+                f"Aapka subscription active ho gaya hai.\n"
+                f"📅 Expiry Date: **{expiry.strftime('%d-%m-%Y')}**\n\n"
+                f"🔗 **Group Join Link:** {invite.invite_link}\n\n"
+                "⚠️ *Yeh link sirf 1 baar use hogi, kisi aur ko share na karein.*"
+            ),
+            parse_mode="Markdown"
+        )
+        await callback.message.reply(f"User `{user_id}` ko link bhej di gayi hai.")
     except Exception as e:
-        print(f"Webhook error: {e}")
-        return web.Response(text="Error", status=500)
+        await callback.message.reply(f"Link send fail: {e}")
+        
+    await callback.answer("Approved!")
 
-async def handle_ping(request):
-    return web.Response(text="Bot is running active!")
+# Reject Callback
+@dp.callback_query(F.data.startswith("rej_"))
+async def reject_user(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return await callback.answer("Sirf Admin reject kar sakta hai.", show_alert=True)
+    user_id = int(callback.data.split("_")[1])
+    try:
+        await bot.send_message(chat_id=user_id, text="❌ Aapka payment verify nahi ho paya. Kripya sahi screenshot ya UTR bhejein.")
+    except Exception:
+        pass
+    await callback.answer("Rejected")
 
-# 5. Background Task: Auto Kick Expired Members
+# 6. Auto-Kick Expired Users Background Task
 async def auto_kick_worker():
     while True:
         try:
@@ -123,24 +139,21 @@ async def auto_kick_worker():
                 try:
                     await bot.ban_chat_member(chat_id=PRIVATE_GROUP_ID, user_id=u_id)
                     await bot.unban_chat_member(chat_id=PRIVATE_GROUP_ID, user_id=u_id)
-                    await bot.send_message(
-                        chat_id=u_id,
-                        text="⚠️ Aapka subscription plan expire ho gaya hai. Dobara access paane ke liye /start karein."
-                    )
+                    await bot.send_message(chat_id=u_id, text="⚠️ Aapka subscription plan khatam ho gaya hai. Dobara judne ke liye /start karein.")
                 except Exception as e:
-                    print(f"Auto-kick issue for {u_id}: {e}")
-                
+                    print(f"Kick error for {u_id}: {e}")
                 await db.remove_user(u_id)
         except Exception as err:
             print(f"Worker check error: {err}")
-        
-        # Har 1 hour me check karega
         await asyncio.sleep(3600)
+
+# Render dummy web server
+async def handle_ping(request):
+    return web.Response(text="Subscription Bot is Running Active!")
 
 async def start_web_server():
     app = web.Application()
     app.router.add_get('/', handle_ping)
-    app.router.add_post('/webhook', handle_payment_webhook)
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.environ.get("PORT", 8080))
@@ -151,9 +164,9 @@ async def main():
     await db.init_db()
     asyncio.create_task(auto_kick_worker())
     await start_web_server()
-    print("Bot polling started...")
+    print("Subscription Bot is Polling...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
-      
+    
