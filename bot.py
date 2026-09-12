@@ -1,142 +1,151 @@
 import os
 import asyncio
 from datetime import datetime
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+from telethon import TelegramClient, events, Button
+from telethon.tl.functions.messages import ExportChatInviteRequest
+from telethon.tl.functions.channels import EditBannedRequest
+from telethon.tl.types import ChatBannedRights
 from aiohttp import web
 
 import database as db
 
+API_ID = int(os.environ.get("API_ID", 38398715))
+API_HASH = os.environ.get("API_HASH", "6d70a41fbc67908aad547a31c3cfa9c3a")
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-PRIVATE_GROUP_ID = int(os.environ.get("PRIVATE_GROUP_ID"))
+PRIVATE_GROUP_ID = int(os.environ.get("PRIVATE_GROUP_ID", "-1005466448251"))
 ADMIN_ID = int(os.environ.get("ADMIN_ID"))
 UPI_ID = os.environ.get("UPI_ID", "your-upi@upi")
 
+bot = TelegramClient('sub_manager_bot', API_ID, API_HASH)
+
 # 1. /start command
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("1 Month Plan - ₹199", callback_data="plan_1_199")],
-        [InlineKeyboardButton("3 Months Plan - ₹499", callback_data="plan_3_499")]
+@bot.on(events.NewMessage(pattern=r'^/start'))
+async def start_handler(event):
+    if not event.is_private:
+        return
+    buttons = [
+        [Button.inline("1 Month Plan - ₹199", b"plan_1_199")],
+        [Button.inline("3 Months Plan - ₹499", b"plan_3_499")]
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(
-        "👋 Welcome! Private Group access ke liye apna plan chunein:",
-        reply_markup=reply_markup
+    await event.respond(
+        "👋 Welcome! Private Group access pane ke liye apna plan select karein:",
+        buttons=buttons
     )
 
-# 2. Plan Select Callback
-async def plan_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    _, months, amount = query.data.split("_")
+# 2. Plan Selection Callback
+@bot.on(events.CallbackQuery(pattern=rb"^plan_"))
+async def plan_cb(event):
+    data = event.data.decode().split("_")
+    months, amount = data[1], data[2]
     text = (
-        f"✅ **Plan:** {months} Month(s)\n"
+        f"✅ **Plan Selected:** {months} Month(s)\n"
         f"💵 **Amount:** ₹{amount}\n\n"
         f"📌 **UPI ID:** `{UPI_ID}`\n\n"
-        "Kisi bhi UPI App (PhonePe / GooglePay / Paytm) se upar di gayi UPI ID par payment karein.\n\n"
-        "Payment ke baad **Transaction Screenshot** ya **12-digit UTR Number** yahan send karein."
+        "Kisi bhi UPI app (Paytm / GPay / PhonePe) se payment karein.\n\n"
+        "Payment complete hone ke baad uska **Screenshot** ya **12-digit UTR/Txn ID** yahan send karein."
     )
-    await query.message.reply_text(text, parse_mode="Markdown")
+    await event.respond(text)
+    await event.answer()
 
-# 3. Screenshot Handler
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.message.from_user
-    keyboard = [
-        [InlineKeyboardButton("Approve 1 Month", callback_data=f"app_{user.id}_1"),
-         InlineKeyboardButton("Approve 3 Months", callback_data=f"app_{user.id}_3")],
-        [InlineKeyboardButton("Reject", callback_data=f"rej_{user.id}")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+# 3. Handle Payment Screenshots & Text (UTR)
+@bot.on(events.NewMessage())
+async def payment_submission(event):
+    if not event.is_private or event.text.startswith('/'):
+        return
     
-    await context.bot.send_photo(
-        chat_id=ADMIN_ID,
-        photo=update.message.photo[-1].file_id,
-        caption=f"Payment Proof Aaya Hai!\nUser: @{user.username} (`{user.id}`)",
-        reply_markup=reply_markup
-    )
-    await update.message.reply_text("Aapka screenshot mil gaya hai. Verify hote hi invite link mil jayega.")
+    sender = await event.get_sender()
+    sender_id = sender.id
+    username = f"@{sender.username}" if sender.username else str(sender_id)
 
-# 4. Text / UTR Handler
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.message.from_user
-    keyboard = [
-        [InlineKeyboardButton("Approve 1 Month", callback_data=f"app_{user.id}_1"),
-         InlineKeyboardButton("Approve 3 Months", callback_data=f"app_{user.id}_3")],
-        [InlineKeyboardButton("Reject", callback_data=f"rej_{user.id}")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await context.bot.send_message(
-        chat_id=ADMIN_ID,
-        text=f"Payment Proof / UTR:\n`{update.message.text}`\nUser: @{user.username} (`{user.id}`)",
-        reply_markup=reply_markup
-    )
-    await update.message.reply_text("Details mil gayi hain. Verify hone par link mil jayega.")
-
-# 5. Approval Handler
-async def approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    
-    if query.from_user.id != ADMIN_ID:
+    if sender_id == ADMIN_ID:
         return
 
-    data = query.data
-    if data.startswith("app_"):
-        _, user_id_str, months_str = data.split("_")
-        user_id = int(user_id_str)
-        months = int(months_str)
+    admin_buttons = [
+        [Button.inline("Approve 1 Month", f"app_{sender_id}_1".encode()),
+         Button.inline("Approve 3 Months", f"app_{sender_id}_3".encode())],
+        [Button.inline("Reject", f"rej_{sender_id}".encode())]
+    ]
 
-        expiry = await db.add_or_update_subscriber(user_id, months)
-        invite = await context.bot.create_chat_invite_link(
-            chat_id=PRIVATE_GROUP_ID,
-            member_limit=1
+    if event.photo:
+        await bot.send_file(
+            ADMIN_ID,
+            file=event.photo,
+            caption=f"Payment Proof Aaya Hai!\nUser: {username} (`{sender_id}`)",
+            buttons=admin_buttons
         )
+    else:
+        await bot.send_message(
+            ADMIN_ID,
+            f"Payment UTR/Text Mila:\n`{event.text}`\nUser: {username} (`{sender_id}`)",
+            buttons=admin_buttons
+        )
+        
+    await event.reply("Aapka payment proof mil chuka hai! Verification hote hi automatic access link mil jayegi.")
+
+# 4. Admin Approval & Single-Use Link
+@bot.on(events.CallbackQuery(pattern=rb"^(app_|rej_)"))
+async def admin_decision(event):
+    if event.sender_id != ADMIN_ID:
+        return await event.answer("Sirf Admin approve kar sakta hai.", alert=True)
+
+    data = event.data.decode().split("_")
+    action = data[0]
+    user_id = int(data[1])
+
+    if action == "app":
+        months = int(data[2])
+        expiry = db.add_or_update_subscriber(user_id, months)
 
         try:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=(
-                    f"🎉 **Payment Verified!**\n\n"
-                    f"Subscription valid till: **{expiry.strftime('%d-%m-%Y')}**\n\n"
-                    f"🔗 **Join Link:** {invite.invite_link}\n\n"
-                    "⚠️ *Yeh link sirf 1 baar use ho sakti hai.*"
-                ),
-                parse_mode="Markdown"
+            invite = await bot(ExportChatInviteRequest(
+                peer=PRIVATE_GROUP_ID,
+                usage_limit=1
+            ))
+            invite_link = invite.link
+
+            await bot.send_message(
+                user_id,
+                f"🎉 **Payment Verified Successfully!**\n\n"
+                f"Subscription Valid Till: **{expiry.strftime('%d-%m-%Y')}**\n\n"
+                f"🔗 **Group Join Link:** {invite_link}\n\n"
+                "⚠️ *Yeh link sirf 1 member ke liye valid hai.*"
             )
-            await query.message.reply_text(f"User `{user_id}` ko invite link bhej di gayi hai.")
+            await event.respond(f"User `{user_id}` ko access link bhej di gayi hai.")
         except Exception as e:
-            await query.message.reply_text(f"Send fail: {e}")
+            await event.respond(f"Error sending link: {e}")
 
-    elif data.startswith("rej_"):
-        user_id = int(data.split("_")[1])
+    elif action == "rej":
         try:
-            await context.bot.send_message(chat_id=user_id, text="❌ Payment verify nahi ho paya.")
+            await bot.send_message(user_id, "❌ Aapka payment verify nahi ho saka. Kripya sahi screenshot ya UTR details bhejein.")
         except Exception:
             pass
-        await query.message.reply_text(f"User `{user_id}` rejected.")
+        await event.respond(f"User `{user_id}` reject kar diya gaya.")
 
-# 6. Background Auto-Kick Task
-async def auto_kick_worker(app: Application):
+    await event.answer("Processed!")
+
+# 5. Background Auto-Kick Task
+async def auto_kick_worker():
+    kick_rights = ChatBannedRights(until_date=None, view_messages=True)
+    unban_rights = ChatBannedRights(until_date=None, view_messages=False)
+
     while True:
         try:
-            expired_users = await db.get_expired_users()
-            for u_id in expired_users:
+            expired = db.get_expired_users()
+            for uid in expired:
                 try:
-                    await app.bot.ban_chat_member(chat_id=PRIVATE_GROUP_ID, user_id=u_id)
-                    await app.bot.unban_chat_member(chat_id=PRIVATE_GROUP_ID, user_id=u_id)
-                    await app.bot.send_message(chat_id=u_id, text="⚠️ Subscription expire ho gaya hai. Dobara join karne ke liye /start karein.")
+                    await bot(EditBannedRequest(PRIVATE_GROUP_ID, uid, kick_rights))
+                    await bot(EditBannedRequest(PRIVATE_GROUP_ID, uid, unban_rights))
+                    await bot.send_message(uid, "⚠️ Aapka subscription period expire ho gaya hai. Phir se join karne ke liye /start karein.")
                 except Exception as e:
-                    print(f"Kick error {u_id}: {e}")
-                await db.remove_user(u_id)
+                    print(f"Kick error for {uid}: {e}")
+                db.remove_user(uid)
         except Exception as err:
             print(f"Worker error: {err}")
         await asyncio.sleep(3600)
 
-# Web server for Render
+# Render dummy web server
 async def handle_ping(request):
-    return web.Response(text="Bot is running active!")
+    return web.Response(text="Subscription Bot is Running!")
 
 async def start_web():
     server = web.Application()
@@ -148,24 +157,12 @@ async def start_web():
     await site.start()
 
 async def main():
-    await db.init_db()
-    
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CallbackQueryHandler(plan_callback, pattern=r"^plan_"))
-    app.add_handler(CallbackQueryHandler(approval_callback, pattern=r"^(app_|rej_)"))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()
-
-    asyncio.create_task(auto_kick_worker(app))
+    db.init_db()
+    await bot.start(bot_token=BOT_TOKEN)
+    asyncio.create_task(auto_kick_worker())
     await start_web()
-
-    while True:
-        await asyncio.sleep(1000)
+    print("Bot Active and Ready!")
+    await bot.run_until_disconnected()
 
 if __name__ == "__main__":
     asyncio.run(main())
